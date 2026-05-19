@@ -20,8 +20,22 @@ class Orchestrator(nn.Module):
         super().__init__()
         self.network_layers = nn.ModuleList(layers_list)
         self.global_state_size = 0
-        for layer in self.network_layers:
+        for layer in layers_list:
             self.global_state_size += layer.state_size
+    
+    def forward(self, u: torch.tensor, global_theta: torch.tensor):
+        new_input = u
+        start = 0
+        end = 0
+        for layer in self.network_layers:
+            end = start + layer.state_size
+            layer_theta = global_theta[:, start:end]
+            if layer.state_size != 0:
+                new_input = layer(new_input, layer_theta)
+            else:
+                new_input = layer(new_input)
+            start = end
+        return new_input
 
 class MeshLayer(nn.Module):
     def __init__(
@@ -64,7 +78,7 @@ class MeshLayer(nn.Module):
     
     def _split_features(self):
         feature_combinations = list(torch.tensor(item, dtype=torch.int64) for item in combinations(range(self.num_features), self.SS_dimension))
-        return feature_combinations
+        return torch.tensor(feature_combinations, dtype=torch.int64)
 
     def _instantiate_GS3DE(self, n_labels, friction, temp, k, M, kb, k2, verbose, parallel):
         u_min = torch.tensor([self.boundaries[0]] * self.SS_dimension)
@@ -125,6 +139,7 @@ class PoolingLayer(nn.Module):
             model_ids = (mesh_layer.indices == pixel).any(dim=1).nonzero().squeeze()
             combination_map[pixel] = model_ids
         self.register_buffer('combination_map', combination_map)
+        self.state_size = 0
 
     def forward(self, inputs: torch.tensor):
         grouped_mesh_inputs = inputs[:, self.combination_map, :]
