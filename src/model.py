@@ -1,4 +1,3 @@
-
 from sympy import *
 from sympy.physics.mechanics import *
 # from symengine import *
@@ -12,11 +11,91 @@ from .utils import verbose_display
 from itertools import product
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+from itertools import combinations
+from math import comb
+
+class Orchestrator(nn.Module):
+    def __init__(self, layers_list: list):
+        super().__init__()
+        self.network_layers = nn.ModuleList(layers_list)
+        self.global_state_size = 0
+        for layer in self.network_layers:
+            self.global_state_size += layer.state_size
+
+class MeshLayer(nn.Module):
+    def __init__(
+        self, num_features: int, max_features: int | float, n_sticks: int, n_labels: int, SS_dimension: int, friction=0, temp=0, k=1, M=1,
+        kb=1.38064852e-23, k2=0, verbose=False, parallel=False, boundaries: tuple[float, float] = (0, 1)):
+        """
+        Parameters:
+          max_features (int or float): If int, the maximum number of features per group.
+            If float, a fraction of the total features.
+          n_sticks: int defining the discretization for each input dimension.
+          boundaries: tuple (u_min, u_max), both of which are type float
+          n_labels: int, number of labels (output dimensions).
+          parallel: whether to create underlying models in parallel.
+        """
+        super().__init__()
+        self.SS_dimension = SS_dimension
+        self.noise_type = "diagonal"
+        self.sde_type = "ito"
+        
+        # Determine feature dimension from boundaries.
+        self.num_features = num_features
+        self.n_sticks = n_sticks
+        self.boundaries = boundaries
+        self.indices = self._split_features()
+
+        self.num_labels = n_labels
+        
+        # Determine max_features based on type.
+        self.max_features = max_features if isinstance(max_features, int) else int(max_features * self.num_features)
+
+        models = []
+        self.models = nn.ModuleList(models)
+        self._instantiate_GS3DE(n_labels, friction, temp, k, M, kb, k2, verbose, parallel)
+        self.state_size = sum([model.state_size for model in self.models])
+        #integer sum fo the state size of this mesh layer --summed from constituent models
+        self.state_sizes = torch.tensor([model.state_size for model in self.models]) 
+        #pytorch tensor of the state sizes for this mesh layer
+        self.cstate_sizes = torch.cat((torch.tensor([0]), self.state_sizes.cumsum(dim=0)))  
+        #cumulative state sizes
+    
+    def _split_features(self):
+        feature_combinations = list(torch.tensor(item, dtype=torch.int64) for item in combinations(range(self.num_features), self.SS_dimension))
+        return feature_combinations
+
+    def _instantiate_GS3DE(self, n_labels, friction, temp, k, M, kb, k2, verbose, parallel):
+        u_min = torch.tensor([self.boundaries[0]] * self.SS_dimension)
+        u_max = torch.tensor([self.boundaries[1]] * self.SS_dimension)
+        def create_gs3de():
+            return GS3DE(self.n_sticks, [u_min, u_max], n_labels, friction, temp, k, M, kb, k2, verbose)
+        if parallel:
+            with ThreadPoolExecutor() as executor:
+                futures = [executor.submit(create_gs3de) for _ in self.indices]
+                for future in as_completed(futures):
+                    self.models.append(future.result())
+        else:
+            for _ in self.indices:
+                self.models.append(create_gs3de())
+    
+    def forward(self, u: torch.tensor, layer_theta: torch.tensor, batch_size: int):
+        """u: batch size * dimension of input matrix
+            layer_theta: 
+        """
+        output = []
+        for i in range(self.models):
+            model = self.models[i]
+            uSlice = u[:self.indices[i]]
+            start = self.cstate_sizes[i]
+            end = self.cstate_sizes[i+1]
+            thetaSlice = layer_theta[: ]
 
 
 
 class GroupGS3DE(nn.Module):
-    """Grouped GS3DE models. It splits the input features into groups and instantiates a GS3DE model for each group."""
+    """Grouped GS3DE models."""
     def __init__(
         self, max_features, n_sticks, boundaries, n_labels, friction=0, temp=0, k=1, M=1,
         kb=1.38064852e-23, k2=0, verbose=False, group_strategy="sequential", parallel=False
@@ -201,7 +280,7 @@ class GS3DE(nn.Module):
         for index in np.ndindex(shape):
             self.x_symbols[index] = dynamicsymbols(f"x_{''.join(map(str, index))}")
             self.dx_symbols[index] = self.x_symbols[index].diff()
-            self.ddx_symbols[index] = self.dx_symbols[index].diff()
+            self.ddx_symbols[index] = self.dx_symbols[index].diff() # TODO 1: should be a parameter
 
     def _init_kinetic_energy(self):
         # Translational kinetic energy.
@@ -259,8 +338,11 @@ class GS3DE(nn.Module):
         self._update_total_lagrangian()
         self.ypred = lambda u: lambdify([*self.x_symbols.flatten()], self.y_prediction(u))
 
-    def _compute_potential_energy(self, u_i, y_i):
+    def _compute_potential_energy(self, u_i, y_i: torch.Tensor | None):
         """Compute the potential energy U that depends on new data u_i and y_i."""
+        if y_i is None:
+            self.U = 0
+            return
         i_idx = self.find_box(u_i)
         point_pred = self.y_prediction(u_i, i_idx)
         difference = (point_pred - y_i.cpu().numpy()) ** 2
@@ -280,7 +362,7 @@ class GS3DE(nn.Module):
         )
         self.ue = lambdify([*self.x_symbols.flatten()], self.U)
 
-    def update_data(self, new_u_i, new_y_i):
+    def update_data(self, new_u_i=None, new_y_i=None):
         """
         Update the model's potential energy based on new data.
         This recomputes U (and its derived dynamics) without redoing the non-potential computations.
