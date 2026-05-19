@@ -80,18 +80,62 @@ class MeshLayer(nn.Module):
             for _ in self.indices:
                 self.models.append(create_gs3de())
     
-    def forward(self, u: torch.tensor, layer_theta: torch.tensor, batch_size: int):
+    def forward(self, u: torch.tensor, layer_theta: torch.tensor):
         """u: batch size * dimension of input matrix
             layer_theta: 
         """
-        output = []
-        for i in range(self.models):
-            model = self.models[i]
-            uSlice = u[:self.indices[i]]
+        outputs = []
+        for i, model in enumerate(self.models):
+            uSlice = u[:,self.indices[i]]
             start = self.cstate_sizes[i]
             end = self.cstate_sizes[i+1]
-            thetaSlice = layer_theta[: ]
+            thetaSlice = layer_theta[:,start: end]
+            prediction = model.num_y_prediction(uSlice, thetaSlice)
+            outputs.append(prediction)
+        return torch.stack(outputs, dim=1)
+    
+    def f(self, time, layer_theta):
+        drift_components = []
+        for i, model in enumerate(self.models):
+            start = self.cstate_sizes[i]
+            end = self.cstate_sizes[i+1]
+            thetaSlice = layer_theta[:, start:end]
+            block_drift = model.f(time, thetaSlice)
+            drift_components.append(block_drift)
+        return torch.cat(drift_components, dim=1)
+    
+    def g(self, time, layer_theta):
+        noise_components = []
+        for i, model in enumerate(self.models):
+            start = self.cstate_sizes[i]
+            end = self.cstate_sizes[i+1]
+            thetaSlice = layer_theta[:, start:end]
+            block_noise = model.g(time, thetaSlice)
+            noise_components.append(block_noise)
+        return torch.cat(noise_components, dim=1)
 
+
+class PoolingLayer(nn.Module):
+    def __init__(self, mesh_layer: MeshLayer):
+        super().__init__()
+        num_cols = comb(mesh_layer.num_features - 1, mesh_layer.SS_dimension - 1)
+        combination_map = torch.empty((mesh_layer.num_features, num_cols), dtype=torch.int64)
+        for pixel in range(mesh_layer.num_features):
+            # Find every row index (Model ID) where either column equals this pixel
+            model_ids = (mesh_layer.indices == pixel).any(dim=1).nonzero().squeeze()
+            combination_map[pixel] = model_ids
+        self.register_buffer('combination_map', combination_map)
+
+    def forward(self, inputs: torch.tensor):
+        grouped_mesh_inputs = inputs[:, self.combination_map, :]
+        soft_max_reduced = torch.logsumexp(grouped_mesh_inputs, dim=2)
+        return soft_max_reduced
+
+class ConvergenceLayer(PoolingLayer):
+    def forward(self, inputs: torch.tensor):
+        pool_group_reduced = super().forward(inputs)
+        convergence_reduced = torch.logsumexp(pool_group_reduced, dim=1)
+        return convergence_reduced
 
 
 class GroupGS3DE(nn.Module):
