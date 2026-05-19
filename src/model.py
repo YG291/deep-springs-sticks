@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .utils import verbose_display
+from utils import verbose_display
 from itertools import product
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,7 +35,7 @@ class Orchestrator(nn.Module):
             else:
                 new_input = layer(new_input)
             start = end
-        return new_input
+        return new_input.squeeze(1)
 
 class MeshLayer(nn.Module):
     def __init__(
@@ -78,7 +78,7 @@ class MeshLayer(nn.Module):
     
     def _split_features(self):
         feature_combinations = list(torch.tensor(item, dtype=torch.int64) for item in combinations(range(self.num_features), self.SS_dimension))
-        return torch.tensor(feature_combinations, dtype=torch.int64)
+        return torch.stack(feature_combinations, dim=0)
 
     def _instantiate_GS3DE(self, n_labels, friction, temp, k, M, kb, k2, verbose, parallel):
         u_min = torch.tensor([self.boundaries[0]] * self.SS_dimension)
@@ -466,9 +466,14 @@ class GS3DE(nn.Module):
         return pred
 
     def num_y_prediction(self, u, theta):
-        q = theta[:self.N].t()
-        ypred = self.ypred(u)
-        return ypred(*q)
+        batch_size = u.shape[0]
+        batch_outputs = []
+        for i in range(batch_size):
+            uSlice = u[i].unsqueeze(0)
+            thetaSlice = theta[i, :self.N]
+            ypred = self.ypred(uSlice)
+            batch_outputs.append(torch.tensor(ypred(*thetaSlice), dtype=torch.float32))
+        return torch.stack(batch_outputs, dim=0)
 
     def f(self, t, theta):
         """Compute the time derivative f(t, theta)."""
