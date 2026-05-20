@@ -1,111 +1,121 @@
-import torch
-import torchsde
-import numpy as np
-
-from torch.utils.data import TensorDataset, DataLoader
 import cProfile
-
-import matplotlib.pyplot as plt
-import concurrent.futures
-
 import sys
-from model import Orchestrator, MeshLayer, PoolingLayer, ConvergenceLayer
+import time
 
-sys.setrecursionlimit(10000)  # or a higher value as needed
+import torch
+import torch.optim as optim
+import torchsde
+from torch.utils.data import TensorDataset, DataLoader
+
+from model import (
+    Orchestrator, MeshLayer, HiddenPoolingLayer, ConvergenceLayer,
+    GroupGS3DE, GS3DE,
+)
+
+sys.setrecursionlimit(10000)
+
+
+def make_data(n_points, num_features, num_labels, eps=0.01):
+    u = torch.rand(n_points, num_features)
+    y = torch.stack([
+        torch.sin(u[:, 0] * u[:, 1]),
+        torch.cos(u[:, 0] * u[:, 1]),
+    ]).t() + eps * torch.randn(n_points, num_labels)
+    return u, y
+
+
+def build_3mesh(num_features, num_labels, n_sticks, SS_dimension, friction, boundaries):
+    kwargs = dict(
+        num_features=num_features, max_features=num_features,
+        n_sticks=n_sticks, SS_dimension=SS_dimension,
+        friction=friction, temp=0.001, k=1, M=1, boundaries=boundaries,
+    )
+    mesh1 = MeshLayer(n_labels=1, **kwargs)
+    mesh2 = MeshLayer(n_labels=1, **kwargs)
+    mesh3 = MeshLayer(n_labels=num_labels, **kwargs)
+    # Middle layers: mean reduction keeps activations bounded; tanh squash adds nonlinearity.
+    # Final layer: softmax-weighted reduction for MNIST-style class scores.
+    return Orchestrator([
+        mesh1, HiddenPoolingLayer(mesh1, reduction='mean', squash='tanh'),
+        mesh2, HiddenPoolingLayer(mesh2, reduction='mean', squash='tanh'),
+        mesh3, ConvergenceLayer(mesh3, reduction='softmax'),
+    ])
+
+
+def train(name, predict_fn, theta, loader, num_epochs, lr=0.1):
+    optimizer = optim.Adam([theta], lr=lr)
+    print(f"\n=== {name} (state_size={theta.shape[1]}) ===")
+    start = time.perf_counter()
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        for u_batch, y_batch in loader:
+            optimizer.zero_grad()
+            predictions = predict_fn(u_batch, theta[:u_batch.shape[0]])
+            loss = torch.mean((predictions - y_batch) ** 2)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print(f"  Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss / len(loader):.4f}")
+    print(f"  Train time: {time.perf_counter() - start:.2f}s")
+
 
 def run_main():
-    eps = 0.01
     n_points = 10
-    
-    # Let's mock a 3-feature input space (matching your existing synthetic setup)
-    # If testing an MNIST-style pipeline later, change 3 to 784
-    num_features = 3 
-    SS_dimension = 2  # Combination pairing size (e.g., pairs of features)
-    num_labels = 2    # Class dimension (e.g., sine vs cosine outputs)
-
-    # Synthetic Input generation
-    u_i_train = torch.rand(n_points, num_features)
-    y_i_train = (torch.stack([
-        torch.sin(u_i_train[:, 0] * u_i_train[:, 1]), 
-        torch.cos(u_i_train[:, 0] * u_i_train[:, 1])
-    ]).t() + eps * torch.randn(n_points, num_labels))
-
-    # Calculate spatial boundaries
-    u_min = torch.min(u_i_train).item()
-    u_max = torch.max(u_i_train).item()
-    boundaries = (u_min, u_max)
-
+    num_features = 3
+    num_labels = 2
+    SS_dimension = 2
     n_sticks = 2
-    fric = 100
-
-    print("--- STEP 1: Initializing Custom Structural Layers ---")
-    
-    # 1. Instantiate the SDE physics Mesh Layer
-    mesh_layer = MeshLayer(
-        num_features=num_features,
-        max_features=num_features,
-        n_sticks=n_sticks,
-        n_labels=num_labels,
-        SS_dimension=SS_dimension,
-        friction=fric,
-        temp=0.001,
-        k=1,
-        M=1,
-        boundaries=boundaries
-    )
-    print(f"Mesh Layer tracking {len(mesh_layer.models)} unique sub-models.")
-    print(f"Total state parameter requirements: {mesh_layer.state_size} variables.")
-
-    # 2. Instantiate the Local Pooling Layer (Sub-models -> Features)
-    pooling_layer = PoolingLayer(mesh_layer=mesh_layer)
-    print(f"Local Pooling map initialized with shape: {pooling_layer.combination_map.shape}")
-
-    # 3. Instantiate the Global Convergence Layer (Features -> Global Class Scores)
-    convergence_layer = ConvergenceLayer(mesh_layer=mesh_layer)
-
-    # 4. Bind them sequentially inside the master Orchestrator
-    orchestrator = Orchestrator([mesh_layer, pooling_layer, convergence_layer])
-    print(f"Orchestrator verified total network state size: {orchestrator.global_state_size}")
-
-    # Prepare standard batch loading data structures
+    friction = 100
     batch_size = 5
-    dataset_train = TensorDataset(u_i_train, y_i_train)
-    loader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+    num_epochs = 5
 
-    print("\n--- STEP 2: Running Sample SDE Integration & Forward Pass Validation ---")
-    
-    t_size = 2
-    ts = torch.linspace(0, 1, t_size)
-    
-    # Simulate an incoming initial global parameter state from your SDE integration engine
-    # In execution, the SDE solver outputs a batch of evolved states over time.
-    # We mock a batch dimension matching our DataLoader batch sizes
-    mock_global_theta = torch.rand(batch_size, orchestrator.global_state_size)
+    u_train, y_train = make_data(n_points, num_features, num_labels)
+    u_min_vec = torch.min(u_train, dim=0).values
+    u_max_vec = torch.max(u_train, dim=0).values
+    boundaries_vec = (u_min_vec, u_max_vec)
+    boundaries_scalar = (torch.min(u_train).item(), torch.max(u_train).item())
+    n_sticks_vec = torch.tensor([n_sticks] * num_features)
 
-    for i, (u_batch, y_batch) in enumerate(loader_train):
-        print(f"\nProcessing Batch {i+1}:")
-        print(f" -> Input Batch Shape: {u_batch.shape}")
-        print(f" -> Target Batch Shape: {y_batch.shape}")
-        
-        # Adjust mock parameter batch size if the final batch drops in size
-        current_batch_size = u_batch.shape[0]
-        batch_theta = mock_global_theta[:current_batch_size, :]
-        
-        # Execute the full pipeline via the clean Orchestrator wrapper function call syntax
-        try:
-            final_predictions = orchestrator(u_batch, batch_theta)
-            
-            print(" -> [SUCCESS] Forward pass executed without shape mismatch or runtime errors!")
-            print(f" -> Output Tensor Shape: {final_predictions.shape} (Expected: ({current_batch_size}, {num_labels}))")
-            print(" -> Sample output raw scores:\n", final_predictions)
-            
-        except Exception as e:
-            print(f" -> [CRASH] Execution failed during the forward pass.")
-            print(f" -> Error Details: {str(e)}")
-            raise e
-            
-        # Break immediately after 1 step—we only care about testing a clean forward pass cycle
-        break 
+    loader = DataLoader(TensorDataset(u_train, y_train), batch_size=batch_size, shuffle=True)
+    ts = torch.linspace(0, 1, 2)
+
+    start = time.perf_counter()
+    orchestrator = build_3mesh(num_features, num_labels, n_sticks, SS_dimension, friction, boundaries_scalar)
+    print(f"\n3-mesh Orchestrator build: {time.perf_counter() - start:.2f}s")
+    theta_mesh = torch.rand(batch_size, orchestrator.global_state_size, requires_grad=True)
+    train(
+        "3-mesh Orchestrator",
+        lambda u, th: orchestrator(u, th, ts),
+        theta_mesh, loader, num_epochs,
+    )
+
+    start = time.perf_counter()
+    group_sde = GroupGS3DE(
+        max_features=2, n_sticks=n_sticks_vec, boundaries=boundaries_vec,
+        n_labels=num_labels, friction=friction, temp=0.001, k=1, M=1,
+        group_strategy="sequential",
+    )
+    print(f"\nGroupGS3DE build: {time.perf_counter() - start:.2f}s")
+    theta_group = torch.rand(batch_size, group_sde.state_size, requires_grad=True)
+    train(
+        "GroupGS3DE (max_features=2)",
+        lambda u, th: group_sde.num_y_prediction(u, torchsde.sdeint(group_sde, th, ts)[-1]),
+        theta_group, loader, num_epochs,
+    )
+
+    start = time.perf_counter()
+    raw_sde = GS3DE(
+        n_sticks=n_sticks_vec, boundaries=boundaries_vec, n_labels=num_labels,
+        friction=friction, temp=0.001, k=1, M=1,
+    )
+    print(f"\nRaw GS3DE build: {time.perf_counter() - start:.2f}s")
+    theta_raw = torch.rand(batch_size, raw_sde.state_size, requires_grad=True)
+    train(
+        "Raw GS3DE (no grouping)",
+        lambda u, th: raw_sde.num_y_prediction(u, torchsde.sdeint(raw_sde, th, ts)[-1]),
+        theta_raw, loader, num_epochs,
+    )
+
 
 if __name__ == '__main__':
     cProfile.run('run_main()', 'profile_stats.prof')

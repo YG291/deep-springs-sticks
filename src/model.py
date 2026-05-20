@@ -15,6 +15,50 @@ from typing import Any
 from itertools import combinations
 from math import comb
 
+import torch
+import torchsde
+
+class DynamicsConnector(torch.autograd.Function):
+    """Differentiable bridge for the sympy-lambdified SDE drift.
+
+    forward computes step = [dq; ddqdt(q,dq)]^T.  backward uses the symbolic
+    Jacobian of ddqdt w.r.t. [q, dq] so gradients can flow through torchsde.
+    """
+
+    @staticmethod
+    def forward(ctx, theta, lambdified_dyn, lambdified_jac, N):
+        q = theta[:, :N].t().detach()
+        dq = theta[:, N:].t().detach()
+        ddqdt = lambdified_dyn(*q, *dq)
+        ddqdt = torch.as_tensor(np.asarray(ddqdt), dtype=theta.dtype, device=theta.device)
+        ddqdt_shape = ddqdt.shape
+        ddqdt = ddqdt.squeeze()
+        if ddqdt_shape[-1] == 1:
+            ddqdt = ddqdt.unsqueeze(-1)
+        step = torch.vstack([dq, ddqdt]).t()
+        ctx.save_for_backward(theta)
+        ctx.lambdified_jac = lambdified_jac
+        ctx.N = N
+        return step
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        theta, = ctx.saved_tensors
+        N = ctx.N
+        batch_size = theta.shape[0]
+        grad_theta = torch.zeros_like(theta)
+        # output[:, :N] = dq = theta[:, N:]  →  identity passthrough
+        grad_theta[:, N:] = grad_output[:, :N]
+        # output[:, N:] = ddqdt(q, dq)  →  use symbolic Jacobian per batch
+        q_np = theta[:, :N].detach().cpu().numpy()
+        dq_np = theta[:, N:].detach().cpu().numpy()
+        for b in range(batch_size):
+            jac = np.asarray(ctx.lambdified_jac(*q_np[b], *dq_np[b]), dtype=np.float64)
+            jac = jac.reshape(N, 2 * N)
+            jac_t = torch.as_tensor(jac, dtype=theta.dtype, device=theta.device)
+            grad_theta[b, :] += grad_output[b, N:] @ jac_t
+        return grad_theta, None, None, None
+
 class Orchestrator(nn.Module):
     def __init__(self, layers_list: list):
         super().__init__()
@@ -23,19 +67,18 @@ class Orchestrator(nn.Module):
         for layer in layers_list:
             self.global_state_size += layer.state_size
     
-    def forward(self, u: torch.tensor, global_theta: torch.tensor):
+    def forward(self, u: torch.tensor, global_theta: torch.tensor, time):
         new_input = u
         start = 0
-        end = 0
         for layer in self.network_layers:
-            end = start + layer.state_size
-            layer_theta = global_theta[:, start:end]
-            if layer.state_size != 0:
-                new_input = layer(new_input, layer_theta)
+            if layer.state_size > 0:
+                end = start + layer.state_size
+                integrated = torchsde.sdeint(layer, global_theta[:, start:end], time)
+                new_input = layer(new_input, integrated[-1])
+                start = end
             else:
                 new_input = layer(new_input)
-            start = end
-        return new_input.squeeze(1)
+        return new_input
 
 class MeshLayer(nn.Module):
     def __init__(
@@ -130,8 +173,15 @@ class MeshLayer(nn.Module):
 
 
 class PoolingLayer(nn.Module):
-    def __init__(self, mesh_layer: MeshLayer):
+    _REDUCTIONS = ("mean", "softmax")
+    _SQUASH = (None, "tanh", "sigmoid")
+
+    def __init__(self, mesh_layer: MeshLayer, reduction: str = "mean", squash: str | None = None):
         super().__init__()
+        if reduction not in self._REDUCTIONS:
+            raise ValueError(f"reduction must be one of {self._REDUCTIONS}; got {reduction!r}")
+        if squash not in self._SQUASH:
+            raise ValueError(f"squash must be one of {self._SQUASH}; got {squash!r}")
         num_cols = comb(mesh_layer.num_features - 1, mesh_layer.SS_dimension - 1)
         combination_map = torch.empty((mesh_layer.num_features, num_cols), dtype=torch.int64)
         for pixel in range(mesh_layer.num_features):
@@ -139,18 +189,37 @@ class PoolingLayer(nn.Module):
             model_ids = (mesh_layer.indices == pixel).any(dim=1).nonzero().squeeze()
             combination_map[pixel] = model_ids
         self.register_buffer('combination_map', combination_map)
+        self.reduction = reduction
+        self.squash = squash
         self.state_size = 0
+
+    def _reduce(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        if self.reduction == "mean":
+            return x.mean(dim=dim)
+        # softmax-weighted sum: bounded by the values being aggregated (unlike logsumexp)
+        weights = torch.softmax(x, dim=dim)
+        return (weights * x).sum(dim=dim)
+
+    def _maybe_squash(self, x: torch.Tensor) -> torch.Tensor:
+        if self.squash == "tanh":
+            return torch.tanh(x)
+        if self.squash == "sigmoid":
+            return torch.sigmoid(x)
+        return x
 
     def forward(self, inputs: torch.tensor):
         grouped_mesh_inputs = inputs[:, self.combination_map, :]
-        soft_max_reduced = torch.logsumexp(grouped_mesh_inputs, dim=2)
-        return soft_max_reduced
+        return self._reduce(grouped_mesh_inputs, dim=2)
+
+class HiddenPoolingLayer(PoolingLayer):
+    def forward(self, inputs: torch.tensor):
+        return self._maybe_squash(super().forward(inputs).squeeze(-1))
 
 class ConvergenceLayer(PoolingLayer):
     def forward(self, inputs: torch.tensor):
         pool_group_reduced = super().forward(inputs)
-        convergence_reduced = torch.logsumexp(pool_group_reduced, dim=1)
-        return convergence_reduced
+        convergence_reduced = self._reduce(pool_group_reduced, dim=1)
+        return self._maybe_squash(convergence_reduced)
 
 
 class GroupGS3DE(nn.Module):
@@ -243,14 +312,15 @@ class GroupGS3DE(nn.Module):
             raise ValueError("output_type must be 'stack' or 'mean'")
 
     def num_y_prediction(self, u, theta, output_type="mean"):
+        preds = torch.stack([
+            model.num_y_prediction(u[:, indices], self.get_theta_group(theta, i))
+            for i, (model, indices) in enumerate(zip(self.models, self.groups_idx))
+        ], dim=0)
         if output_type == "stack":
-            return torch.stack([torch.tensor(model.num_y_prediction(u[:, indices], self.get_theta_group(theta, i, predict=True)))
-                                for i, (model, indices) in enumerate(zip(self.models, self.groups_idx))], dim=0)
-        elif output_type == "mean":
-            return torch.mean(torch.stack([torch.tensor(model.num_y_prediction(u[:, indices], self.get_theta_group(theta, i, predict=True)))
-                                             for i, (model, indices) in enumerate(zip(self.models, self.groups_idx))]), dim=0)
-        else:
-            raise ValueError("output_type must be 'stack' or 'mean'")
+            return preds
+        if output_type == "mean":
+            return preds.mean(dim=0)
+        raise ValueError("output_type must be 'stack' or 'mean'")
 
     def get_theta_group(self, theta, group, predict=False):
         if predict:
@@ -395,7 +465,8 @@ class GS3DE(nn.Module):
             self.inv_mass_matrix = simplify(LM_nonpot.mass_matrix.pinv())
         self.forcing_nonpot = simplify(LM_nonpot.forcing)
         self._update_total_lagrangian()
-        self.ypred = lambda u: lambdify([*self.x_symbols.flatten()], self.y_prediction(u))
+        symbols_list = [*self.x_symbols.flatten()]
+        self.ypred = lambda u: lambdify(symbols_list, self.y_prediction(u))
 
     def _compute_potential_energy(self, u_i, y_i: torch.Tensor | None):
         """Compute the potential energy U that depends on new data u_i and y_i."""
@@ -415,10 +486,10 @@ class GS3DE(nn.Module):
         self.forcing_pot = Matrix([-diff(self.U, q) for q in self.x_symbols.flatten()])
         self.forcing_vector = Add(self.forcing_nonpot, self.forcing_pot)
         self.evol_dynamics = simplify(self.inv_mass_matrix * self.forcing_vector)
-        self.lambdified_dyn = lambdify(
-            [*self.x_symbols.flatten(), *self.dx_symbols.flatten()],
-            self.evol_dynamics - self.friction * self.dx_symbols.reshape(-1, 1)
-        )
+        all_vars = [*self.x_symbols.flatten(), *self.dx_symbols.flatten()]
+        dyn_expr = self.evol_dynamics - self.friction * self.dx_symbols.reshape(-1, 1)
+        self.lambdified_dyn = lambdify(all_vars, dyn_expr)
+        self.lambdified_dyn_jac = lambdify(all_vars, Matrix(dyn_expr).jacobian(all_vars))
         self.ue = lambdify([*self.x_symbols.flatten()], self.U)
 
     def update_data(self, new_u_i=None, new_y_i=None):
@@ -433,11 +504,11 @@ class GS3DE(nn.Module):
         """Return the lambda function for the i-th dimension."""
         val = u - i * self.ell - self.u_min
         if div_by_ell:
-            val /= self.ell
+            val = val / self.ell
         if flip_ind is not None:
-            val[flip_ind] *= -1
-        val[np.abs(val) < 1e-8] = 0
-        return val
+            val = val.clone()
+            val[flip_ind] = val[flip_ind] * -1
+        return torch.where(val.abs() < 1e-8, torch.zeros_like(val), val)
 
     def find_box(self, u):
         """Return the box where the input u is located."""
@@ -466,26 +537,30 @@ class GS3DE(nn.Module):
         return pred
 
     def num_y_prediction(self, u, theta):
+        u = torch.clamp(u, self.u_min.unsqueeze(0), self.u_max.unsqueeze(0))
+        i = self.find_box(u)
+        ld = self.lamd(i, u)
+        dimension = i.shape[1]
+        offsets = torch.tensor(
+            list(product([0, 1], repeat=dimension)),
+            device=u.device, dtype=torch.int64,
+        )
+        weights = torch.prod(
+            (1 - ld.unsqueeze(1)) * (offsets == 0) + ld.unsqueeze(1) * (offsets != 0),
+            dim=2,
+        )
+        grid_points = i.unsqueeze(1) + offsets.unsqueeze(0)
+        theta_grid = theta[:, :self.N].reshape(-1, *self.symbols_shape)
         batch_size = u.shape[0]
-        batch_outputs = []
-        for i in range(batch_size):
-            uSlice = u[i].unsqueeze(0)
-            thetaSlice = theta[i, :self.N]
-            ypred = self.ypred(uSlice)
-            batch_outputs.append(torch.tensor(ypred(*thetaSlice), dtype=torch.float32))
-        return torch.stack(batch_outputs, dim=0)
+        n_corners = offsets.shape[0]
+        batch_idx = torch.arange(batch_size, device=u.device).view(-1, 1).expand(-1, n_corners)
+        corner_idx = (batch_idx,) + tuple(grid_points[..., d] for d in range(dimension))
+        corner_values = theta_grid[corner_idx]
+        return (weights.unsqueeze(-1) * corner_values).sum(dim=1)
 
     def f(self, t, theta):
-        """Compute the time derivative f(t, theta)."""
-        q = theta[:, :self.N].t()
-        dq = theta[:, self.N:].t()
-        ddqdt = torch.tensor(self.lambdified_dyn(*q, *dq))
-        ddqdt_shape = ddqdt.shape
-        ddqdt = ddqdt.squeeze()
-        if ddqdt_shape[-1] == 1:
-            ddqdt = ddqdt.unsqueeze(-1)
-        step = torch.vstack([dq, ddqdt])
-        return step.t()
+        """Compute the time derivative f(t, theta) with autograd-aware bridge."""
+        return DynamicsConnector.apply(theta, self.lambdified_dyn, self.lambdified_dyn_jac, self.N)
 
     def g(self, t, theta):
         # return self.eta_cte * torch.ones_like(theta)
@@ -519,4 +594,7 @@ class GS3DE(nn.Module):
         """Compute the MSE loss using provided data."""        
         # loss = torch.sum((torch.tensor(self.num_y_prediction(u_i, theta)) - y_i) ** 2)
         # return loss / u_i.shape[0]
-        return 2 * self.cost(theta) / (u_i.shape[0]* self.k)
+        #return 2 * self.cost(theta) / (u_i.shape[0]* self.k)
+        y_pred = self.num_y_prediction(u_i, theta)
+        loss = torch.mean((y_pred - y_i) ** 2)
+        return loss
