@@ -1,0 +1,464 @@
+\documentclass[11pt]{article}
+
+%==============================================================
+%  How src/model.py works — a code walkthrough
+%==============================================================
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+}
+
+%--- code styling -------------------------------------------------
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codekw}{RGB}{20,60,160}
+\definecolor{codestr}{RGB}{40,120,40}
+\definecolor{codecom}{RGB}{120,120,120}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  rulecolor=\color{codebg},
+  numbers=none,
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+}
+\lstset{style=py}
+
+\newtcolorbox{ideabox}[1]{
+  enhanced, breakable,
+  colback=blue!2!white, colframe=blue!40!black,
+  fonttitle=\bfseries,
+  title={#1},
+  boxrule=0.4pt, arc=2pt,
+  left=4pt, right=4pt, top=4pt, bottom=4pt
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\xv}{\mathbf{x}}
+\newcommand{\uv}{\mathbf{u}}
+\newcommand{\yv}{\mathbf{y}}
+\newcommand{\Mv}{\mathbf{M}}
+\newcommand{\Bv}{\mathbf{B}}
+\newcommand{\Av}{\mathbf{A}}
+\newcommand{\Fv}{\mathbf{F}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\textbf{How \texttt{src/model.py} works}\\
+\large A walkthrough of the springs-and-sticks PyTorch SDE module}
+\date{}
+\author{}
+
+\begin{document}
+\maketitle
+
+\noindent\code{src/model.py} defines two \code{nn.Module} classes that together implement the springs-and-sticks (SS) SDE in a form \code{torchsde.sdeint} can integrate:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \code{GroupGS3DE} --- a divide-and-conquer wrapper that splits the input features into groups and instantiates one core model per group.
+  \item \code{GS3DE} --- the actual springs-and-sticks SDE on a single (sub-)domain. All of the interesting physics lives here.
+\end{itemize}
+
+\tableofcontents
+\bigskip\hrule\bigskip
+
+%==============================================================
+\section{Architecture: \texttt{GroupGS3DE} wraps \texttt{GS3DE}}
+%==============================================================
+
+Building one symbolic Lagrangian over a full $d$-dimensional grid scales as $O(N_s^d)$ degrees of freedom --- exponential in the input dimension. \code{GroupGS3DE} mitigates this by partitioning the $d$ input features into smaller groups (of size $\le$ \code{max\_features}) and giving each group its own \code{GS3DE} model.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \code{split\_features(num\_features, strategy)} returns a list of index tensors, either sequential (\code{torch.split(arange(d), max\_features)}) or random (\code{torch.split(torch.randperm(d), \dots)}).
+  \item For each index group, a separate \code{GS3DE} is constructed with the corresponding slice of the boundaries. Construction can run in a \code{ThreadPoolExecutor} when \code{parallel=True}.
+  \item \code{self.models} is an \code{nn.ModuleList}; \code{self.state\_sizes} tracks each sub-model's state size; \code{self.cstate\_sizes} is the cumulative sum, used to slice a joint \code{theta} into per-model chunks.
+\end{enumerate}
+
+All glue methods --- \code{f}, \code{g}, \code{cost}, \code{loss}, \code{y\_prediction}, \code{num\_y\_prediction} --- iterate over \code{self.models}, call the same method on each, and either concatenate (\code{f, g}), sum (\code{cost}), or average (\code{y\_prediction}) the results. \code{get\_theta\_group(theta, i)} returns the slice of \code{theta} that belongs to sub-model $i$:
+\begin{lstlisting}
+def get_theta_group(self, theta, group, predict=False):
+    if predict:
+        return theta[self.cstate_sizes[group]:self.cstate_sizes[group+1]]
+    return theta[:, self.cstate_sizes[group]:self.cstate_sizes[group+1]]
+\end{lstlisting}
+
+The rest of this document is about \code{GS3DE}; \code{GroupGS3DE} is a thin orchestrator.
+
+%==============================================================
+\section{\texttt{GS3DE.\_\_init\_\_}: physical parameters and one-time setup}
+%==============================================================
+
+The constructor stores the physical parameters (\code{k}, \code{M}, \code{friction}, \code{temp}, \code{kb}, \code{k2}) and computes a few derived quantities used everywhere else:
+
+\begin{lstlisting}
+self.ell       = (self.u_max - self.u_min) / self.n_sticks
+self.M         = M / torch.prod(self.n_sticks)
+self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
+self.eta_cte   = float(np.sqrt(2 * self.friction * temp * kb / self.M))
+\end{lstlisting}
+
+\noindent\begin{tabular}{@{}lp{0.74\linewidth}@{}}
+\toprule
+\code{ell}        & cell width per axis. \\
+\code{M}          & total mass distributed evenly across sticks. \\
+\code{state\_size} & $2$ phase-space coords (position + velocity) $\times$ $\prod_b(N_s^b+1)$ grid vertices $\times$ \code{n\_labels} output channels. This is the dimension \code{torchsde} integrates. \\
+\code{eta\_cte}   & the noise amplitude $\sigma = \sqrt{2\gamma T k_B / M}$ from the fluctuation--dissipation relation. \\
+\bottomrule
+\end{tabular}
+
+\medskip
+Then it performs the \emph{symbolic} setup, once and for all, in fixed order:
+
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+  \item \code{\_init\_symbols} --- create sympy dynamic symbols on the grid.
+  \item \code{\_init\_kinetic\_energy} --- build $K_\text{tr}, K_\text{rot}$.
+  \item \code{\_init\_elastic\_energy} --- build $U_\text{el}$ (only nonzero if \code{k2 != 0}).
+  \item \code{\_init\_lagrangian} --- assemble $L_\text{nonpot}$, derive the mass matrix and non-potential forcing, and call \code{\_update\_total\_lagrangian} once.
+\end{enumerate}
+
+\begin{ideabox}{The split: static skeleton vs.\ data-dependent piece}
+The data-dependent potential $U(\xv)$ is \textbf{not} built in \code{\_\_init\_\_}: it is supplied later via \code{update\_data(u\_i, y\_i)}. Everything that does not depend on the data --- the symbolic positions, the kinetic energies, the mass matrix --- is computed exactly once. This is the whole point of the \code{\_init\_lagrangian} / \code{\_update\_total\_lagrangian} split.
+\end{ideabox}
+
+%==============================================================
+\section{The symbolic skeleton}
+%==============================================================
+
+\subsection*{\texttt{\_init\_symbols}}
+
+Builds a numpy array of \code{sympy.dynamicsymbols} with shape
+\[
+(\underbrace{N_s^0+1, \dots, N_s^{d-1}+1}_{\text{grid}},\, \underbrace{m}_{\text{output channels}}).
+\]
+So \code{x\_symbols[i, j, ..., p]} is the height $x_{(i,j,\dots)}^p$ of the stick at that grid vertex in output channel $p$. The arrays \code{dx\_symbols} and \code{ddx\_symbols} hold the first and second time-derivatives of each symbol. Total number of symbolic variables: \code{self.N = prod(shape)}.
+
+\subsection*{\texttt{\_init\_kinetic\_energy}}
+
+For each axis $b$ it takes the ``front'' slice (\code{slice(1, None)}) and ``back'' slice (\code{slice(None, -1)}) along that axis to extract neighboring stick velocity pairs $(\dot x_{\vec i + \hat e^b}, \dot x_{\vec i})$:
+
+\begin{lstlisting}
+for i in range(len(shape) - 1):                # over input dims
+    sf = [slice(None)]*len(shape); sf[i] = slice(1, None)
+    sb = [slice(None)]*len(shape); sb[i] = slice(None, -1)
+    diff = (dx_symbols[tuple(sf)] + dx_symbols[tuple(sb)])**2
+    ktr += (M/8) * Add(*diff.ravel())          # translational
+    diff = (dx_symbols[tuple(sf)] - dx_symbols[tuple(sb)])**2
+    krot += (M/24) * Add(*diff.ravel())        # rotational
+\end{lstlisting}
+
+The result is sympy expressions:
+\[
+K_\text{tr} = \frac{M}{8}\sum_{b,\vec i}(\dot x_{\vec i+\hat e^b} + \dot x_{\vec i})^2,
+\qquad
+K_\text{rot} = \frac{M}{24}\sum_{b,\vec i}(\dot x_{\vec i+\hat e^b} - \dot x_{\vec i})^2.
+\]
+
+\subsection*{\texttt{\_init\_elastic\_energy}}
+
+Same neighbor pattern but on positions, with an offset by \code{self.ell[i]}:
+\[
+U_\text{el} = \frac{k_2}{2}\sum_{b,\vec i}\bigl(x_{\vec i+\hat e^b} - x_{\vec i} - \ell^b\bigr)^2.
+\]
+Skipped (left as $0$) when \code{k2 == 0}, which is the default.
+
+\subsection*{\texttt{\_init\_lagrangian}}
+
+Combines the non-potential pieces and runs sympy's Euler--Lagrange machinery:
+
+\begin{lstlisting}
+self.L_nonpot = simplify(Add(self.ktr, self.krot, -self.uelastic_symbols))
+LM = LagrangesMethod(self.L_nonpot, self.x_symbols.flatten())
+LM.form_lagranges_equations()
+self.mass_matrix     = simplify(LM.mass_matrix)
+self.inv_mass_matrix = simplify(LM.mass_matrix.inv())   # falls back to .pinv()
+self.forcing_nonpot  = simplify(LM.forcing)
+self._update_total_lagrangian()                         # see next section
+self.ypred = lambda u: lambdify([*x_symbols.flatten()],
+                                 self.y_prediction(u))
+\end{lstlisting}
+
+\code{self.mass\_matrix} and \code{self.inv\_mass\_matrix} live for the lifetime of the model: they don't depend on data.
+
+%==============================================================
+\section{Bringing in data: \texttt{update\_data}}
+%==============================================================
+
+\code{update\_data(new\_u\_i, new\_y\_i)} does exactly two things:
+
+\subsection*{\texttt{\_compute\_potential\_energy(u\_i, y\_i)}}
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+  \item \code{find\_box(u\_i)} returns the integer multi-index $\vec i$ of the cell that contains $\uv_i$.
+  \item \code{y\_prediction(u\_i, i\_idx)} returns the symbolic vector $\hat\yv(\uv_i)$ as a multilinear combination of the surrounding stick heights (see Section~\ref{sec:pwlin}).
+  \item Builds the symbolic potential
+  \[
+  U(\xv) \;=\; \frac{k}{2}\sum_{j,p}\bigl(\hat y^p(\uv_j) - y_j^p\bigr)^2.
+  \]
+\end{enumerate}
+
+\subsection*{\texttt{\_update\_total\_lagrangian}}
+\begin{lstlisting}
+self.lagrangian    = Add(self.L_nonpot, -self.U)
+self.forcing_pot   = Matrix([-diff(self.U, q) for q in x_symbols.flatten()])
+self.forcing_vector = Add(self.forcing_nonpot, self.forcing_pot)
+self.evol_dynamics = simplify(self.inv_mass_matrix * self.forcing_vector)
+
+self.lambdified_dyn = lambdify(
+    [*x_symbols.flatten(), *dx_symbols.flatten()],
+    self.evol_dynamics - self.friction * dx_symbols.reshape(-1, 1))
+self.ue = lambdify([*x_symbols.flatten()], self.U)
+\end{lstlisting}
+
+After this call:
+\begin{itemize}[leftmargin=*,itemsep=0pt]
+  \item \code{lambdified\_dyn(*q, *dq)} returns $\ddot\xv = \Mv^{-1}\Fv(\xv,\dot\xv) - \gamma\dot\xv$ as fast numerical code (compiled by sympy's \code{lambdify}).
+  \item \code{ue(*q)} returns $U(\xv)$ numerically.
+\end{itemize}
+
+These two compiled functions are what \code{f}, \code{cost}, \code{dw} actually call at integration time --- no sympy in the hot loop.
+
+%==============================================================
+\section{Piecewise-linear prediction}\label{sec:pwlin}
+%==============================================================
+
+Three helpers turn an input $\uv$ into a prediction:
+
+\begin{lstlisting}
+def find_box(self, u):
+    i = ((u - self.u_min) / self.ell).to(torch.int)
+    return torch.clip(i, 0, self.n_sticks - 1)
+
+def lamd(self, i, u, flip_ind=None, div_by_ell=True):
+    val = u - i*self.ell - self.u_min
+    if div_by_ell: val /= self.ell
+    return val                              # the lambda_i^b(u)
+\end{lstlisting}
+
+\code{find\_box} maps $\uv$ to the integer cell index $\vec i$. \code{lamd} returns the in-cell coordinate $\lambda_{\vec i}^b(\uv) \in [0,1]$.
+
+\code{\_y\_prediction(u, i=None)} assembles the multilinear interpolant:
+\begin{lstlisting}
+u = torch.clamp(u, u_min, u_max)
+i = find_box(u) if i is None else i
+ld = lamd(i, u)
+offsets = torch.tensor(list(product([0,1], repeat=d)))
+grid_points = i.unsqueeze(1) + offsets.unsqueeze(0)
+weights = torch.prod((1-ld)*(offsets==0) + ld*(offsets!=0), axis=2)
+assert torch.all(weights.sum(axis=1) - 1 < 1e-5)
+symbols = self.x_symbols[index_tuple]
+pred = sum(weights * symbols, axis=corners)
+\end{lstlisting}
+
+The assertion is the sanity check that $\sum_{\vec j} w_{\vec j} = 1$ inside every cell. The result \code{pred} is a vector of \emph{symbolic} expressions in the stick positions --- ready to be squared into a potential.
+
+\code{num\_y\_prediction(u, theta)} is the purely numerical sibling: it evaluates the cached \code{self.ypred(u)} (which is \code{lambdify}d from the symbolic prediction) on the positions stored in \code{theta}.
+
+%==============================================================
+\section{The SDE interface: \texttt{f} and \texttt{g}}
+%==============================================================
+
+These are the two methods \code{torchsde.sdeint} calls at every Euler step. The argument \code{theta} has shape \code{(batch, state\_size)} with the first half holding positions $\xv$ and the second half velocities $\dot\xv$.
+
+\subsection*{\texttt{f(t, theta)} --- the drift}
+\begin{lstlisting}
+def f(self, t, theta):
+    q  = theta[:, :self.N].t()                  # positions
+    dq = theta[:, self.N:].t()                  # velocities
+    ddqdt = torch.tensor(self.lambdified_dyn(*q, *dq))
+    return torch.vstack([dq, ddqdt]).t()
+\end{lstlisting}
+This computes
+\[
+\mathbf{f}(\boldsymbol\theta) \;=\; \begin{pmatrix} \dot\xv \\ \Mv^{-1}\Fv(\xv,\dot\xv) - \gamma\dot\xv \end{pmatrix}.
+\]
+The branch on \code{ddqdt\_shape} handles the degenerate one-dimensional case.
+
+\subsection*{\texttt{g(t, theta)} --- the diffusion}
+\begin{lstlisting}
+def g(self, t, theta):
+    return torch.cat([
+        torch.zeros_like(theta[:, :self.N]),
+        self.eta_cte * torch.ones_like(theta[:, self.N:])
+    ], dim=1)
+\end{lstlisting}
+Position rows are zero (positions inherit noise only \emph{indirectly}, through integrating noisy velocities); velocity rows are \code{eta\_cte} $=\sigma$. Combined with \code{noise\_type = "diagonal"} and \code{sde\_type = "ito"}, this tells \code{torchsde} the SDE is
+\[
+\dd\boldsymbol\theta \;=\; \mathbf{f}(\boldsymbol\theta)\,\dd t \;+\; \Bv\,\dd W_t,
+\qquad \Bv = \mathrm{diag}(0,\dots,0,\sigma,\dots,\sigma).
+\]
+
+%==============================================================
+\section{Loss, energy, work}
+%==============================================================
+
+\begin{tabular}{@{}lp{0.78\linewidth}@{}}
+\toprule
+\code{cost(theta)}  & Evaluates \code{self.ue(*q)} --- the data potential $U(\xv)$ on each batch element. Since $U=(k/2)\sum(\hat y - y)^2$, this is the (unnormalized) squared-error loss times $k/2$. \\
+\code{loss(theta, u\_i, y\_i)} & Returns $2U/(N\cdot k) =$ MSE per data point. \\
+\code{dcost(theta)} & The total time-derivative $\dd U/\dd t$, computed by sympy via \code{self.U.diff()} and then \code{lambdify}d. \\
+\code{dw(theta)} & The instantaneous power $\dd W/\dd t = M\langle\ddot\xv, \dot\xv\rangle$ --- used by the Jarzynski free-energy estimator in \code{src/entropy.py}. \\
+\bottomrule
+\end{tabular}
+
+\begin{lstlisting}
+def dw(self, theta):
+    q  = theta[:, :self.N].t()
+    dq = theta[:, self.N:].t()
+    ddqdt = torch.tensor(self.lambdified_dyn(*q, *dq)).squeeze()
+    return torch.sum(ddqdt * dq, dim=0) * self.M
+\end{lstlisting}
+
+%==============================================================
+\section{Lifecycle in a training loop}
+%==============================================================
+
+The usage pattern (as in \code{src/profiling.py}) is:
+
+\begin{lstlisting}
+sde = GroupGS3DE(max_features, n_sticks, boundaries, n_labels, ...)
+theta0 = None
+for u_i, y_i in loader_train:
+    sde.update_data(u_i, y_i)                # rebuild U, ddqdt, ue
+    if theta0 is None:
+        theta0 = torch.rand((num_runs, sde.state_size))
+    thetas = torchsde.sdeint(sde, theta0, ts, method='euler')
+    # sde.f and sde.g are called at every Euler step
+    theta0 = thetas[-1, :]                   # warm-start next batch
+\end{lstlisting}
+
+Only data-dependent pieces are rebuilt between mini-batches. The kinetic energy, mass matrix, and elastic energy are computed exactly once in \code{\_\_init\_\_}; the data potential and the compiled drift function are rebuilt on every \code{update\_data}; the SDE solver only ever calls the cheap numerical \code{f, g}.
+
+%==============================================================
+\section{How are the sticks actually moved forward in time?}
+%==============================================================
+
+There is a tiny time increment $\Delta t$ and the integration scheme is \textbf{Euler--Maruyama}, but \code{model.py} does not run the time-stepping itself --- it just hands \code{f} and \code{g} to \code{torchsde.sdeint}, which loops in C.
+
+\medskip
+\noindent The state vector is
+\[
+\boldsymbol\theta(t) \;=\; \begin{pmatrix} \xv(t) \\ \dot\xv(t) \end{pmatrix} \in \R^{2N}.
+\]
+One Euler--Maruyama step is
+\[
+\boldsymbol\theta(t+\Delta t) \;=\; \boldsymbol\theta(t) \;+\; \mathbf{f}(t,\boldsymbol\theta)\,\Delta t \;+\; \mathbf{g}(t,\boldsymbol\theta)\,\sqrt{\Delta t}\;\bm\eta, \qquad \bm\eta \sim \mathcal{N}(0,\mathbb{I}).
+\]
+Concretely, what \code{torchsde.sdeint(sde, theta0, ts, method='euler')} does is essentially:
+
+\begin{lstlisting}
+theta = theta0
+for k in range(len(ts) - 1):
+    dt    = ts[k+1] - ts[k]
+    eta   = torch.randn_like(theta)
+    drift = sde.f(ts[k], theta)              # (dx/dt, d2x/dt2)
+    noise = sde.g(ts[k], theta)              # (0,...,0, sigma,...,sigma)
+    theta = theta + drift*dt + noise*eta*sqrt(dt)
+\end{lstlisting}
+
+So \code{sde.f} returns \emph{velocities and accelerations} (how fast positions and velocities are currently changing), and the solver multiplies that by \code{dt} to push the state forward one tick. The accelerations themselves are computed inside \code{sde.f} by calling \code{self.lambdified\_dyn(*q, *dq)}, which is a numerically compiled function that evaluates
+\[
+\ddot\xv \;=\; \Mv^{-1}\Fv(\xv,\dot\xv) - \gamma\dot\xv
+\]
+at the current state.
+
+\begin{ideabox}{Where does $\Delta t$ come from?}
+$\Delta t$ comes entirely from the user's choice of \code{ts = torch.linspace(t\_start, t\_end, t\_size)}; the solver uses the gaps between successive entries of \code{ts}. In \code{profiling.py} you have \code{ts = torch.linspace(0, 1, 2)}, which means one Euler step of size $\Delta t = 1$ (good for profiling, bad for accuracy). For real runs \code{t\_size} should be in the hundreds or thousands so $\Delta t$ is small.
+\end{ideabox}
+
+\noindent\textbf{Take-away.}\quad The sticks ``move'' inside \code{torchsde.sdeint}, not in any \code{model.py} function. \code{model.py} only specifies the \emph{rules} of motion (\code{f} for the drift, \code{g} for the noise); the solver applies those rules step by step.
+
+%==============================================================
+\section{Function-wise flow at a glance}
+%==============================================================
+
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+profiling.run_main()
+|
++-- GroupGS3DE.__init__()                            [ONCE, ~seconds-minutes]
+|   +-- GS3DE.__init__()         per feature group
+|       +-- _init_symbols()                    <- sympy variables
+|       +-- _init_kinetic_energy()             <- K_tr, K_rot
+|       +-- _init_elastic_energy()             <- U_el (often 0)
+|       +-- _init_lagrangian()
+|           +-- LagrangesMethod(...)           <- mass_matrix, inv_mass_matrix
+|           +-- _update_total_lagrangian()     <- no-op: U is still 0
+|
++-- for each epoch:
+    +-- for each mini-batch (u_i, y_i):
+        |
+        +-- sde.update_data(u_i, y_i)                [PER BATCH]
+        |   +-- _compute_potential_energy(u_i, y_i)
+        |   |   +-- find_box(u_i)                    <- which cell?
+        |   |   +-- y_prediction(u_i, i_idx)         <- symbolic y_hat
+        |   |       +-- _y_prediction()
+        |   |           +-- lamd(i, u)               <- lambda in [0,1]
+        |   |           +-- (multilinear corner weights)
+        |   +-- _update_total_lagrangian()
+        |       +-- lagrangian   = L_nonpot - U
+        |       +-- evol_dynamics = M^-1 * forcing
+        |       +-- lambdified_dyn = lambdify(...)   <- FAST numeric ddx(x,dx)
+        |
+        +-- sde.loss(theta0, u_i, y_i)               <- report MSE
+        |
+        +-- torchsde.sdeint(sde, theta0, ts, 'euler') [PER EULER STEP x t_size]
+        |   +-- for k in range(t_size - 1):
+        |       +-- sde.f(t, theta)
+        |       |   +-- lambdified_dyn(*q, *dq)      <- compute ddx
+        |       +-- sde.g(t, theta)                  <- sigma on velocity rows
+        |       +-- theta += f*dt + g*eta*sqrt(dt)   <- Euler-Maruyama
+        |
+        +-- theta0 = thetas[-1]                      <- warm-start next batch
+\end{lstlisting}
+
+\subsection*{How to read this tree}
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Top block (\code{\_\_init\_\_})} runs once and builds the symbolic skeleton that does \emph{not} depend on data: mass matrix, inverse mass matrix, kinetic energies. This is the slow sympy work; it is amortized over the whole training run.
+  \item \textbf{\code{update\_data} (per batch)} rebuilds only the data-dependent piece $U(\xv)$ and recompiles the numerical drift function \code{lambdified\_dyn}. The mass matrix is \emph{not} rebuilt --- it never changes.
+  \item \textbf{\code{sdeint} (per Euler step inside a batch)} is the hot loop. It only ever calls the cheap numerical functions \code{f} and \code{g} --- no sympy in this loop. Each call advances the state by one $\Delta t$.
+\end{itemize}
+
+%==============================================================
+\section{Summary table}
+%==============================================================
+
+\noindent\begin{tabular}{p{0.34\linewidth} p{0.42\linewidth} p{0.18\linewidth}}
+\toprule
+\textbf{Method} & \textbf{Role} & \textbf{Recomputed} \\
+\midrule
+\code{\_init\_symbols}        & sympy variables on the grid                              & once \\
+\code{\_init\_kinetic\_energy}  & $K_\text{tr}, K_\text{rot}$ symbolically                 & once \\
+\code{\_init\_elastic\_energy}  & $U_\text{el}$ symbolically (if \code{k2}$\ne 0$)         & once \\
+\code{\_init\_lagrangian}       & $L_\text{nonpot}$, mass matrix, non-pot.\ forcing        & once \\
+\code{\_compute\_potential\_energy} & build $U(\xv)$ from new data                          & per \code{update\_data} \\
+\code{\_update\_total\_lagrangian}  & rederive $\ddot\xv$ symbolically, lambdify it          & per \code{update\_data} \\
+\code{find\_box, lamd, \_y\_prediction} & piecewise-linear interpolation kernel             & per call \\
+\code{f(t, theta)}            & SDE drift for \code{torchsde}                          & per Euler step \\
+\code{g(t, theta)}            & SDE noise matrix                                       & per Euler step \\
+\code{cost, loss, dcost, dw}  & diagnostics (energy, MSE, power)                       & on demand \\
+\bottomrule
+\end{tabular}
+
+\end{document}

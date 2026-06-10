@@ -75,7 +75,10 @@ def run_main():
     boundaries_vec = (u_min_vec, u_max_vec)
     boundaries_scalar = (torch.min(u_train).item(), torch.max(u_train).item())
     n_sticks_vec = torch.tensor([n_sticks] * num_features)
-
+    # [(n_sticks+1)^num_features] * 2 * num_labels -> state_size of the ss model
+    #this is because we need to model position + velocity, and also we need a phase-space for every dimension so *2 *2 
+    n_sticks_vec_group = torch.tensor([n_sticks*3] * num_features)
+    n_sticks_vec_raw = torch.tensor([n_sticks + 1] * num_features) # +1  hard coded
     loader = DataLoader(TensorDataset(u_train, y_train), batch_size=batch_size, shuffle=True)
     ts = torch.linspace(0, 1, 2)
 
@@ -91,7 +94,7 @@ def run_main():
 
     start = time.perf_counter()
     group_sde = GroupGS3DE(
-        max_features=2, n_sticks=n_sticks_vec, boundaries=boundaries_vec,
+        max_features=2, n_sticks=n_sticks_vec_group, boundaries=boundaries_vec,
         n_labels=num_labels, friction=friction, temp=0.001, k=1, M=1,
         group_strategy="sequential",
     )
@@ -105,7 +108,7 @@ def run_main():
 
     start = time.perf_counter()
     raw_sde = GS3DE(
-        n_sticks=n_sticks_vec, boundaries=boundaries_vec, n_labels=num_labels,
+        n_sticks=n_sticks_vec_raw, boundaries=boundaries_vec, n_labels=num_labels,
         friction=friction, temp=0.001, k=1, M=1,
     )
     print(f"\nRaw GS3DE build: {time.perf_counter() - start:.2f}s")
