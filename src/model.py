@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from utils import verbose_display
+from .utils import verbose_display
 from itertools import product
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,6 +78,7 @@ class Orchestrator(nn.Module):
                 start = end
             else:
                 new_input = layer(new_input)
+            start = end
         return new_input
 
 class MeshLayer(nn.Module):
@@ -121,7 +122,7 @@ class MeshLayer(nn.Module):
     
     def _split_features(self):
         feature_combinations = list(torch.tensor(item, dtype=torch.int64) for item in combinations(range(self.num_features), self.SS_dimension))
-        return torch.stack(feature_combinations, dim=0)
+        return torch.tensor(feature_combinations, dtype=torch.int64)
 
     def _instantiate_GS3DE(self, n_labels, friction, temp, k, M, kb, k2, verbose, parallel):
         u_min = torch.tensor([self.boundaries[0]] * self.SS_dimension)
@@ -537,6 +538,7 @@ class GS3DE(nn.Module):
         return pred
 
     def num_y_prediction(self, u, theta):
+<<<<<<< HEAD
         u = torch.clamp(u, self.u_min.unsqueeze(0), self.u_max.unsqueeze(0))
         i = self.find_box(u)
         ld = self.lamd(i, u)
@@ -557,6 +559,11 @@ class GS3DE(nn.Module):
         corner_idx = (batch_idx,) + tuple(grid_points[..., d] for d in range(dimension))
         corner_values = theta_grid[corner_idx]
         return (weights.unsqueeze(-1) * corner_values).sum(dim=1)
+=======
+        q = theta[:self.N].t()
+        ypred = self.ypred(u)
+        return ypred(*q)
+>>>>>>> parent of b152a6f (forward pass bug fixes)
 
     def f(self, t, theta):
         """Compute the time derivative f(t, theta) with autograd-aware bridge."""
