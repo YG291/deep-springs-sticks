@@ -538,32 +538,9 @@ class GS3DE(nn.Module):
         return pred
 
     def num_y_prediction(self, u, theta):
-<<<<<<< HEAD
-        u = torch.clamp(u, self.u_min.unsqueeze(0), self.u_max.unsqueeze(0))
-        i = self.find_box(u)
-        ld = self.lamd(i, u)
-        dimension = i.shape[1]
-        offsets = torch.tensor(
-            list(product([0, 1], repeat=dimension)),
-            device=u.device, dtype=torch.int64,
-        )
-        weights = torch.prod(
-            (1 - ld.unsqueeze(1)) * (offsets == 0) + ld.unsqueeze(1) * (offsets != 0),
-            dim=2,
-        )
-        grid_points = i.unsqueeze(1) + offsets.unsqueeze(0)
-        theta_grid = theta[:, :self.N].reshape(-1, *self.symbols_shape)
-        batch_size = u.shape[0]
-        n_corners = offsets.shape[0]
-        batch_idx = torch.arange(batch_size, device=u.device).view(-1, 1).expand(-1, n_corners)
-        corner_idx = (batch_idx,) + tuple(grid_points[..., d] for d in range(dimension))
-        corner_values = theta_grid[corner_idx]
-        return (weights.unsqueeze(-1) * corner_values).sum(dim=1)
-=======
         q = theta[:self.N].t()
         ypred = self.ypred(u)
         return ypred(*q)
->>>>>>> parent of b152a6f (forward pass bug fixes)
 
     def f(self, t, theta):
         """Compute the time derivative f(t, theta) with autograd-aware bridge."""
