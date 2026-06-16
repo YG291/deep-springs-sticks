@@ -238,7 +238,7 @@ class GS3DE(nn.Module):
                 slice_back  = [slice(None)] * len(self.x_symbols.shape)
                 slice_front[i] = slice(1, None)
                 slice_back[i]  = slice(None, -1)
-                difference = (self.x_symbols[tuple(slice_front)] - self.x_symbols[tuple(slice_back)] - self.ell[i]) ** 2
+                difference = (self.x_symbols[tuple(slice_front)] - self.x_symbols[tuple(slice_back)] - float(self.ell[i])) ** 2
                 difference = difference.ravel()
                 uelastic = Add(uelastic, self.k2 / 2 * Add(*difference))
         self.uelastic_symbols = simplify(uelastic)
@@ -544,7 +544,7 @@ class SympyCalc:
 
 class _Equilibrium(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, model, u_model):
+    def forward(ctx, X, k, k2, model, u_model):
         z = model.forward(u_model, X)
         q = z[0, :model.N]
         yhat = model.y_prediction_approx(u_model, q)
@@ -563,7 +563,9 @@ class _Equilibrium(torch.autograd.Function):
             yhat = model.y_prediction_approx(u_model, q_leaf)
             dL_dz = torch.autograd.grad(yhat, q_leaf, grad_outputs=grad_yhat)[0]
         dL_dX, dL_dk, dL_dk2 = model.backward_vjp(q, w, X, dL_dz)
-        return dL_dX, None, None
+        dL_dk  = torch.as_tensor(dL_dk,  dtype=X.dtype, device=X.device)
+        dL_dk2 = torch.as_tensor(dL_dk2, dtype=X.dtype, device=X.device)
+        return dL_dX, dL_dk, dL_dk2, None, None
     
     #Critical: if we want to end up parameterizing k, k2 then include the other two
 
@@ -590,8 +592,8 @@ class DEQ(nn.Module):
         self.N = int(torch.prod(self.n_sticks + 1)) * n_labels
         self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
 
-        self.k = k
-        self.k2 = k2
+        self.k = nn.Parameter(torch.tensor(float(k)))
+        self.k2 = nn.Parameter(torch.tensor(float(k2)))
         self.M = M / torch.prod(self.n_sticks)
         self.kb = kb
         self.temp = temp
@@ -739,23 +741,40 @@ class DEQ(nn.Module):
         """
         return torch.cat(
             [torch.zeros_like(theta[:, :self.N]), 
-             self.eta_cte*torch.ones_like(theta[:, self.N:])], dim=1)
+             self._eta_cur*torch.ones_like(theta[:, self.N:])], dim=1)
+        #_eta_cte defined in forward
     
     def forward(self, u, X, y0=None, 
-                dt = 0.01, window=20, max_iters=100, tol=1e-3):
+                dt = 0.01, window=20, max_iters=100, tol=1e-3, floor = 1e-3, cooling = 0.75):
+        """
+        eta_cte : base noise amplitude
+        cooling : rate at which we decrease _eta_cur geometrically
+        _eta_cur : noise injected in the window
+        """
         self.w = self.soft_weights(u)
         self.X = X
         if y0 is None:
             y0 = torch.zeros(1,2*self.N, device=u.device)
         ts = torch.tensor([0.0, window*dt], device=u.device)
         y=y0
-        for _ in range(max_iters):
+        self._eta_cur = self.eta_cte
+
+        #all this _eta_cur stuff is defined to construct a geometric decrease in alpha
+        #and corresponding noise level -> alpha = 0 forces F to converge to approx 0
+        #-> we force it to converge to exactly 0.0
+
+        #affects "multi-basin stochasticity of the gradient estimate" which I dont understand so its ok...
+        for k in range(max_iters):
+            if self._eta_cur < floor:
+                self._eta_cur = 0.0
+            self._eta_cur *= cooling
             ys = torchsde.sdeint(self, y, ts, dt=dt, method="euler")
             y = ys[-1]
             q, dq = y[:,:self.N], y[:,self.N:]
             F=self.net_force(q[0], dq[0], self.w, self.X)
-            if F.norm() < tol:
+            if F.norm() < tol and self._eta_cur == 0.0:
                 break
+            #F is ~0
         self.z_star = y
         return y
     
@@ -819,7 +838,7 @@ class DEQ(nn.Module):
         return dL_dX, dL_dk, dL_dk2
     
     def predict_equilibrium(self, u, X):
-        return _Equilibrium.apply(X, self, u)
+        return _Equilibrium.apply(X, self.k, self.k2, self, u)
 
 
 class MeshNet(nn.Module):
