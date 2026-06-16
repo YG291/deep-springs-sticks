@@ -13,6 +13,8 @@ from itertools import product
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import torchsde
+
 
 
 class GroupGS3DE(nn.Module):
@@ -131,7 +133,6 @@ class GroupGS3DE(nn.Module):
         for idx, group_idx in enumerate(self.groups_idx):
             new_group = new_u_i[:, group_idx]
             self.models[idx].update_data(new_group, new_y_i)
-
 
 
 class GS3DE(nn.Module):
@@ -374,3 +375,522 @@ class GS3DE(nn.Module):
         # loss = torch.sum((torch.tensor(self.num_y_prediction(u_i, theta)) - y_i) ** 2)
         # return loss / u_i.shape[0]
         return 2 * self.cost(theta) / (u_i.shape[0]* self.k)
+    
+class SympyCalc:
+    def __init__(self, n_sticks, boundaries, n_labels, M=1):
+        """
+        To be initialized per DEQ instance
+        """
+        d = boundaries[0].shape[0]
+        if isinstance(n_sticks, int):
+            self.n_sticks = torch.ones(d, dtype=int) * n_sticks
+        elif isinstance(n_sticks, torch.Tensor):
+            self.n_sticks = n_sticks.clone().detach().to(torch.int)
+        else:
+            self.n_sticks = torch.tensor(n_sticks, dtype=torch.int)
+
+        # Set state_size using n_labels.
+        self.u_min, self.u_max = boundaries[0], boundaries[1]
+        self.ell = (self.u_max - self.u_min) / self.n_sticks
+        self.n_labels = n_labels
+        self.M = M / torch.prod(self.n_sticks)
+        self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
+        self.k  = symbols('k')
+        self.k2 = symbols('k2')
+
+        # Initialize symbolic variables, kinetic and elastic energies.
+        self._init_symbols(n_labels)
+        self._init_kinetic_energy()
+        self._init_elastic_energy()
+        self._init_lagrangian() 
+        self._init_regr_params()
+        self._init_potential()
+        self._init_force()
+        self._init_jacobians()
+        self._lambdify_all()
+
+
+    def _init_symbols(self, n_labels):
+        # Create symbolic arrays with shape: (n_sticks+1) x ... x (n_labels)
+        shape = tuple([int(n) for n in np.append(self.n_sticks + 1, n_labels)])
+        self.symbols_shape = shape
+        self.N = np.prod(shape)
+        self.x_symbols = np.empty(shape, dtype=object)
+        self.dx_symbols = np.empty_like(self.x_symbols, dtype=object)
+        self.ddx_symbols = np.empty_like(self.x_symbols, dtype=object)
+
+        for index in np.ndindex(shape):
+            self.x_symbols[index] = dynamicsymbols(f"x_{''.join(map(str, index))}")
+            self.dx_symbols[index] = self.x_symbols[index].diff()
+            self.ddx_symbols[index] = self.dx_symbols[index].diff()
+
+    def _init_kinetic_energy(self):
+        # Translational kinetic energy.
+        ktr = 0
+        for i in range(len(self.symbols_shape) - 1):
+            slice_front = [slice(None)] * len(self.symbols_shape)
+            slice_back  = [slice(None)] * len(self.symbols_shape)
+            slice_front[i] = slice(1, None)
+            slice_back[i]  = slice(None, -1)
+            difference = (self.dx_symbols[tuple(slice_front)] + self.dx_symbols[tuple(slice_back)]) ** 2
+            difference = difference.ravel()
+            ktr = Add(ktr, (self.M.item() / 8) * Add(*difference))
+        self.ktr = simplify(ktr)
+
+        # Rotational kinetic energy.
+        krot = 0
+        for i in range(len(self.symbols_shape) - 1):
+            slice_front = [slice(None)] * len(self.symbols_shape)
+            slice_back  = [slice(None)] * len(self.symbols_shape)
+            slice_front[i] = slice(1, None)
+            slice_back[i]  = slice(None, -1)
+            difference = (self.dx_symbols[tuple(slice_front)] - self.dx_symbols[tuple(slice_back)]) ** 2
+            difference = difference.ravel()
+            krot = Add(krot, (self.M.item() / 24) * Add(*difference))
+        self.krot = simplify(krot)
+
+    def _init_elastic_energy(self):
+        # Elastic energy to keep neighboring states near the rest length.
+        uelastic = 0
+        for i in range(len(self.x_symbols.shape) - 1):
+            slice_front = [slice(None)] * len(self.x_symbols.shape)
+            slice_back  = [slice(None)] * len(self.x_symbols.shape)
+            slice_front[i] = slice(1, None)
+            slice_back[i]  = slice(None, -1)
+            difference = (self.x_symbols[tuple(slice_front)] - self.x_symbols[tuple(slice_back)] - float(self.ell[i])) ** 2
+            difference = difference.ravel()
+            uelastic = Add(uelastic, self.k2 / 2 * Add(*difference))
+        self.uelastic_symbols = simplify(uelastic)
+
+    def _init_lagrangian(self):
+        # Compute non-potential Lagrangian (kinetic + elastic).
+        self.L_nonpot = simplify(Add(self.ktr, self.krot, -self.uelastic_symbols))
+        # Initially, set the potential energy U to zero.
+        self.U = 0  
+        LM_nonpot = LagrangesMethod(self.L_nonpot, self.x_symbols.flatten())
+        LM_nonpot.form_lagranges_equations()
+        self.mass_matrix = simplify(LM_nonpot.mass_matrix)
+        try:
+            self.inv_mass_matrix = simplify(LM_nonpot.mass_matrix.inv())
+        except Exception as e:
+            print(e)
+            self.inv_mass_matrix = simplify(LM_nonpot.mass_matrix.pinv())
+        self.forcing_nonpot = simplify(LM_nonpot.forcing)
+    
+    def _init_regr_params(self):
+        self.X_symbols = np.array(symbols(f'X_0:{self.n_labels}'))
+        #X = W * y_hat + b with n_labels for each of such X symbols
+        self.n_nodes = int(np.prod([int(n) + 1 for n in self.n_sticks]))
+        #written as the number of "grid points" in the grid (i.e. intersections between grid lines)
+        self.w_symbols = np.array(symbols(f'w_0:{self.n_nodes}'))
+        #weights depending on which 'box' u is in
+
+    def _init_potential(self):
+        pos = self.x_symbols.reshape(self.n_nodes, self.n_labels)
+        # position is (node from _init_regr_params, label)
+        U = 0
+        for i in range(self.n_labels):
+            pred_i = Add(*[self.w_symbols[node] * pos[node, i] for node in range(self.n_nodes)])
+            #prediction for label i is summ over nodes (w[node]*x[node, i]) 
+            U = Add(U, (self.k / 2) * (pred_i - self.X_symbols[i])**2)
+        self.U = U
+        self.forcing_pot = Matrix([-diff(U, q) for q in self.x_symbols.flatten()])
+        #potential force on each node is -∂U/∂x = -k(pred - X)*w
+        #and, pred = wz* -> Jz_pot = -kw(wtranspose)
+    
+    def _init_force(self):
+        self.F = self.forcing_nonpot + self.forcing_pot
+        # net force F = ∂L/∂z*
+        
+        #direct consequence:
+        #∂F/∂z* = ∂F_nonpot/∂z* + ∂F_pot/∂z* -> second piece is pointwise
+    
+    def _init_jacobians(self):
+        x_flat = Matrix(self.x_symbols.flatten())
+        X_vector = Matrix(self.X_symbols)
+
+        #shared nonpotential derivatives
+        self.Jz_nonpot = self.forcing_nonpot.jacobian(x_flat)
+        #∂F_nonpot/∂z*
+        self.Jk2_nonpot = diff(self.forcing_nonpot, self.k2)
+        #∂F/∂k2
+
+        #pointwise (potential) derivatives
+        self.Jz_pot = self.forcing_pot.jacobian(x_flat)
+        #∂F_pot/∂z*
+        self.Jk_pot = diff(self.forcing_pot, self.k)
+        #∂F/∂k
+        self.JX_pot = self.forcing_pot.jacobian(X_vector)
+        #∂F/∂X
+
+    def _lambdify_all(self):
+        state_args = [*self.x_symbols.flatten(), *self.dx_symbols.flatten()]
+        nonpot_args = [*state_args, self.k2]
+        pot_args = [*state_args, *self.w_symbols, *self.X_symbols, self.k]
+
+        #shared nonpot
+        self.f_nonpot = lambdify(nonpot_args, self.forcing_nonpot, cse=True)
+        self.jz_nonpot = lambdify(nonpot_args, self.Jz_nonpot, cse = True)
+        self.jk2_nonpot = lambdify(nonpot_args, self.Jk2_nonpot, cse = True)
+
+        #pointwise (pot)
+        self.f_pot = lambdify(pot_args, self.forcing_pot, cse=True)
+        self.jz_pot = lambdify(pot_args, self.Jz_pot, cse=True)
+        self.jk_pot = lambdify(pot_args, self.Jk_pot, cse=True)
+        self.jx_pot = lambdify(pot_args, self.JX_pot, cse=True)
+
+        self.inv_mass = np.array(self.inv_mass_matrix.tolist(), dtype=np.float64)
+        #const mass matr
+
+class _Equilibrium(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, X, model, u_model):
+        z = model.forward(u_model, X)
+        q = z[0, :model.N]
+        yhat = model.y_prediction_approx(u_model, q)
+        ctx.model = model
+        ctx.u_model = u_model
+        ctx.save_for_backward(q, model.w, X)
+        return yhat
+    
+    @staticmethod
+    def backward(ctx, grad_yhat):
+        model = ctx.model
+        u_model = ctx.u_model
+        q,w,X = ctx.saved_tensors
+        with torch.enable_grad():
+            q_leaf = q.detach().requires_grad_(True)
+            yhat = model.y_prediction_approx(u_model, q_leaf)
+            dL_dz = torch.autograd.grad(yhat, q_leaf, grad_outputs=grad_yhat)[0]
+        dL_dX, dL_dk, dL_dk2 = model.backward_vjp(q, w, X, dL_dz)
+        return dL_dX, None, None
+    
+    #Critical: if we want to end up parameterizing k, k2 then include the other two
+
+class DEQ(nn.Module):
+    def __init__(self, n_sticks, boundaries, n_labels, sympy, 
+                 friction=0, temp=0, k=1, M=1, kb=1.38064852e-23, k2=0, verbose=False, tau=0.05):
+        super().__init__()
+        self.noise_type = "diagonal"
+        self.sde_type = "ito"
+
+        d = boundaries[0].shape[0]
+        if isinstance(n_sticks, int):
+            self.n_sticks = torch.ones(d, dtype=int) * n_sticks
+        elif isinstance(n_sticks, torch.Tensor):
+            self.n_sticks = n_sticks.clone().detach().to(torch.int)
+        else:
+            self.n_sticks = torch.tensor(n_sticks, dtype=torch.int)
+        assert self.n_sticks.shape[0] == d, "n_sticks must have the same length as input dimension"
+
+        self.u_min = boundaries[0]
+        self.u_max = boundaries[1]
+        self.ell = ((self.u_max - self.u_min) / self.n_sticks)
+        self.n_labels = n_labels
+        self.N = int(torch.prod(self.n_sticks + 1)) * n_labels
+        self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
+
+        self.k = k
+        self.k2 = k2
+        self.M = M / torch.prod(self.n_sticks)
+        self.kb = kb
+        self.temp = temp
+        self.friction = float(friction)
+        self.eta_cte = float(np.sqrt(2 * self.friction * temp * kb / self.M))
+
+        self.sympy = sympy
+        #sympy is literally an instance of SympyCalc
+
+        self.register_buffer('tau', torch.as_tensor(float(tau)))
+        self.n_boxes = int(torch.prod(self.n_sticks))
+        self._grid_constants()
+
+    def _grid_constants(self):
+        d = self.u_min.shape[0]
+        offsets = torch.tensor(list(product([0, 1], repeat=d)), dtype=torch.long)
+        node_radix = (self.n_sticks + 1).tolist()
+        box_radix = self.n_sticks.tolist()
+        node_strides = [1] * d
+        box_strides = [1] * d
+        for j in range(d - 2, -1, -1):
+            node_strides[j] = node_strides[j + 1] * node_radix[j + 1]
+            box_strides[j] = box_strides[j + 1] * box_radix[j + 1]
+        self.register_buffer('offsets', offsets)
+        self.register_buffer('node_strides', torch.tensor(node_strides, dtype=torch.long))
+        self.register_buffer('box_strides', torch.tensor(box_strides, dtype=torch.long))
+
+    def find_box_approx(self, u):
+        device = u.device
+        um = self.u_min.to(device)
+        el = self.ell.to(device)
+        u = torch.clamp(u, um.unsqueeze(0), self.u_max.to(device).unsqueeze(0))
+        memberships = []
+        for j in range(u.shape[1]):
+            n_j = int(self.n_sticks[j])
+            lines = um[j] + el[j] * torch.arange(n_j + 1, device=device, dtype=u.dtype)
+            tau_j = self.tau * el[j]
+            ind = torch.sigmoid((u[:, j:j + 1] - lines.unsqueeze(0)) / tau_j)
+            m_j = ind[:, :-1] - ind[:, 1:]
+            m_j = m_j / (m_j.sum(dim=1, keepdim=True) + 1e-12)
+            memberships.append(m_j)
+        return memberships
+
+    def y_prediction_approx(self, u, theta):
+        memberships = self.find_box_approx(u)
+        batch_size = u.shape[0]
+        device = u.device
+        d = u.shape[1]
+        um = self.u_min.to(device)
+        el = self.ell.to(device)
+        offsets = self.offsets.to(device)
+        node_strides = self.node_strides.to(device)
+        box_strides = self.box_strides.to(device)
+        n_sticks = self.n_sticks.to(device)
+
+        ypred = torch.zeros(batch_size, self.n_labels, device=device)
+        theta_points = theta[:self.N].view(-1, self.n_labels)
+        for i in range(self.n_boxes):
+            grid_idx = (i // box_strides) % n_sticks
+            box_start = grid_idx.to(u.dtype) * el + um
+            ld = torch.clamp((u - box_start.unsqueeze(0)) / el.unsqueeze(0), 0.0, 1.0)
+            ld_exp = ld.unsqueeze(1)
+            off_exp = offsets.unsqueeze(0)
+            corner_w = torch.prod((1 - ld_exp) * (off_exp == 0) + ld_exp * (off_exp == 1), dim=2)
+            corner_indices = torch.sum((grid_idx.unsqueeze(0) + offsets) * node_strides.unsqueeze(0), dim=1)
+            pred_i = corner_w @ theta_points[corner_indices]
+            gate = torch.ones(batch_size, device=device)
+            for j in range(d):
+                gate = gate * memberships[j][:, int(grid_idx[j])]
+            ypred = ypred + gate.unsqueeze(-1) * pred_i
+        return ypred
+    
+    def soft_weights(self, u):
+        """same as y_prediction_approx, but we get [n_points, n_nodes]
+        which is used for f_pot(*q, *dq, *w_row, ...)"""
+        memberships = self.find_box_approx(u)
+        batch_size = u.shape[0]
+        device = u.device
+        d = u.shape[1]
+        um = self.u_min.to(device); el = self.ell.to(device)
+        offsets = self.offsets.to(device)
+        node_strides = self.node_strides.to(device)
+        box_strides = self.box_strides.to(device)
+        n_sticks = self.n_sticks.to(device)
+        n_nodes = int(torch.prod(self.n_sticks + 1))
+
+        w = torch.zeros(batch_size, n_nodes, device=device)
+        for i in range(self.n_boxes):
+            grid_idx = (i // box_strides) % n_sticks
+            box_start = grid_idx.to(u.dtype) * el + um
+            ld = torch.clamp((u - box_start.unsqueeze(0)) / el.unsqueeze(0), 0.0, 1.0)
+            ld_exp = ld.unsqueeze(1); off_exp = offsets.unsqueeze(0)
+            corner_w = torch.prod((1 - ld_exp) * (off_exp == 0) + ld_exp * (off_exp == 1), dim=2)  # [batch, 2^d]
+            corner_indices = torch.sum((grid_idx.unsqueeze(0) + offsets) * node_strides.unsqueeze(0), dim=1)  # [2^d]
+            gate = torch.ones(batch_size, device=device)
+            for j in range(d):
+                gate = gate * memberships[j][:, int(grid_idx[j])]
+            w[:, corner_indices] += gate.unsqueeze(-1) * corner_w
+        return w   # [n_points, n_nodes]
+    
+    def net_force(self, q, dq, w, X):
+        """
+        q, dq - torch[N]
+        w- torch[n_points, n_nodes]
+        X- torch[n_points, n_labels]
+
+        They are converted into numpy because lambdified functions are NumPy
+        -> converting the pot portions to closed-form aggregate is wayy faster
+        """
+        qn  = q.detach().cpu().numpy()
+        dqn = dq.detach().cpu().numpy()
+        wn  = w.detach().cpu().numpy()
+        Xn  = X.detach().cpu().numpy()
+        k= float(self.k)
+        k2 = float(self.k2)
+
+        #nonpot
+        F = np.asarray(self.sympy.f_nonpot(*qn, *dqn, k2)).reshape(self.N)
+
+        #pot
+        w_args = [wn[:,j] for j in range(wn.shape[1])]
+        #n_nodes arrays, each [n_points]
+        X_args = [Xn[:,l] for l in range(Xn.shape[1])]
+        #n_labels arrays, each [n_points]
+        fpot = np.asarray(self.sympy.f_pot(*qn, *dqn, *w_args, *X_args, k))
+        #(N, 1, n_points)
+        F=F+ fpot.reshape(self.N, -1).sum(axis=1)
+
+        return torch.as_tensor(F, dtype = q.dtype, device = q.device)
+    
+    def f(self, t, theta):
+        """Compute the time derivative f(t, theta).
+        
+        This is the drift"""
+        q = theta[:, :self.N]
+        dq = theta[:, self.N:]
+        F = self.net_force(q[0], dq[0], self.w, self.X)
+        inv_mass = torch.as_tensor(self.sympy.inv_mass, dtype =theta.dtype, device = theta.device)
+        accel = inv_mass@F - self.friction * dq[0]
+        return torch.cat([dq[0], accel]).unsqueeze(0)
+
+    def g(self, t, theta):
+        """
+        diffusion (for diagonal noise)
+        """
+        return torch.cat(
+            [torch.zeros_like(theta[:, :self.N]), 
+             self.eta_cte*torch.ones_like(theta[:, self.N:])], dim=1)
+    
+    def forward(self, u, X, y0=None, 
+                dt = 0.01, window=20, max_iters=100, tol=1e-3):
+        self.w = self.soft_weights(u)
+        self.X = X
+        if y0 is None:
+            y0 = torch.zeros(1,2*self.N, device=u.device)
+        ts = torch.tensor([0.0, window*dt], device=u.device)
+        y=y0
+        for _ in range(max_iters):
+            ys = torchsde.sdeint(self, y, ts, dt=dt, method="euler")
+            y = ys[-1]
+            q, dq = y[:,:self.N], y[:,self.N:]
+            F=self.net_force(q[0], dq[0], self.w, self.X)
+            if F.norm() < tol:
+                break
+        self.z_star = y
+        return y
+    
+    def assemble_Jz(self, q, w):
+        """
+        builds ∂F/∂z*
+        """
+        # q: torch [N] (equilibrium positions)
+        qn = q.detach().cpu().numpy()
+        dqn = np.zeros(self.N)
+        wn = w.detach().cpu().numpy()
+        k = float(self.k)
+        k2 = float(self.k2)
+
+        #nonpot
+        Jz = np.asarray(self.sympy.jz_nonpot(*qn, *dqn, k2)).reshape(self.N, self.N)
+
+        #pot
+        w_args = [wn[:,j] for j in range(wn.shape[1])]
+        X_args = [np.zeros(wn.shape[0]) for _ in range(self.n_labels)]
+        Jz_pot = np.asarray(self.sympy.jz_pot(*qn, *dqn, *w_args, *X_args, k))
+        Jz = Jz + Jz_pot.reshape(self.N, self.N, -1).sum(axis=2)
+        
+        return torch.as_tensor(Jz, dtype=q.dtype, device=q.device)
+    
+    def backward_vjp(self, q, w, X, dL_dz):
+        """
+        vector jacobian product, that is
+
+        q: [N] equilibrium positions
+        X: [n_points, n_labels]
+        Computes JX, Jk, Jk2, v
+        """
+        Jz = self.assemble_Jz(q, w)
+        v = torch.linalg.solve(Jz.t(), -dL_dz)
+        #this solves the v_row = -(∂L/∂z*)*(∂F/∂z*)^-1
+
+        qn  = q.detach().cpu().numpy()
+        dqn = np.zeros(self.N)
+        wn  = w.detach().cpu().numpy()
+        Xn  = X.detach().cpu().numpy()
+        vn  = v.detach().cpu().numpy()
+        k = float(self.k); k2 = float(self.k2)
+
+        w_args = [wn[:, j] for j in range(wn.shape[1])]
+        X_args = [Xn[:, l] for l in range(Xn.shape[1])]
+
+        #now we compute dL/dX per data point X [n_points, n_labels]
+        JX = np.asarray(self.sympy.jx_pot(*qn, *dqn, *w_args, *X_args, k))
+        dL_dX = np.einsum('m, mln->nl', vn, JX)
+
+        #compute dL/dk sum over points
+        Jk = np.asarray(self.sympy.jk_pot(*qn, *dqn, *w_args, *X_args, k))   # [N, 1, n_points]
+        dL_dk = float(vn @ Jk.reshape(self.N, -1).sum(axis=1))
+
+        #compute dL/dk2 sum over points
+        Jk2 = np.asarray(self.sympy.jk2_nonpot(*qn, *dqn, k2)).reshape(self.N)
+        dL_dk2 = float(vn @ Jk2)
+
+        dL_dX = torch.as_tensor(dL_dX, dtype=q.dtype, device=q.device)
+        return dL_dX, dL_dk, dL_dk2
+    
+    def predict_equilibrium(self, u, X):
+        return _Equilibrium.apply(X, self, u)
+
+
+class MeshNet(nn.Module):
+    def __init__(self, layers_spec, n_sticks, boundaries, n_labels,
+                 friction=0, temp=0, k=1, M=1, kb=1.38064852e-23, k2=0, tau=0.05):
+        """
+        note that we must have k2> 0 otherwise inv Jz doesnt exist
+        """
+        super().__init__()
+        self.layers_spec = layers_spec
+
+        #example:
+        # layers_spec = [
+        # [ {"u_dims": [0,1]}, {"u_dims": [2,3]}, ... ],              
+        # [ {"u_dims": [0,1], "sources": [(0,0),(1,0)]}, ... ],     
+        # ]
+
+
+        self.n_labels = n_labels
+        u_min, u_max = boundaries
+
+        self._sympy_cache = {}
+        self.layers = nn.ModuleList()
+        self.W = nn.ParameterDict()
+        self.b = nn.ParameterDict()
+
+        for layer_idx, layer in enumerate(layers_spec):
+            layer_models = nn.ModuleList()
+            for model_idx, spec in enumerate(layer):
+                u_dims = spec["u_dims"]
+                d = len(u_dims)
+                model_bounds = (u_min[u_dims], u_max[u_dims])
+                sig = (int(n_sticks), d, n_labels)
+                if sig not in self._sympy_cache:
+                    self._sympy_cache[sig] = SympyCalc([n_sticks] * d, model_bounds, n_labels, M=M)
+                sympy = self._sympy_cache[sig]
+                deq = DEQ([n_sticks] * d, model_bounds, n_labels, sympy,
+                          friction=friction, temp=temp, k=k, M=M, kb=kb, k2=k2, tau=tau)
+                layer_models.append(deq)
+
+                if "sources" in spec:
+                    n_src = len(spec["sources"])
+                    key = f"{layer_idx}_{model_idx}"
+                    self.W[key] = nn.Parameter(0.1 * torch.randn(self.n_labels, n_src))
+                    self.b[key] = nn.Parameter(torch.zeros(self.n_labels))
+            self.layers.append(layer_models)
+
+    def forward(self, u, y):
+        """
+        u: [n_points, num_features]
+        y: [n_points, n_labels]
+        """
+        prev_outputs = None
+        for layer_idx, layer_models in enumerate(self.layers):
+            spec_layer = self.layers_spec[layer_idx]
+            #each model's entry in layers_spec tracks that model's u_dims
+            layer_outputs = []
+            for model_idx, model in enumerate(layer_models):
+                spec = spec_layer[model_idx]
+                u_model = u[:,spec["u_dims"]]
+                # dim [n_points, d]
+                if "sources" in spec:
+                    key = f"{layer_idx}_{model_idx}"
+                    S = torch.stack([prev_outputs[m][:,dim] for m,dim in spec["sources"]], dim = 1)
+                    X_model=S@self.W[key].t() + self.b[key]
+
+                    #this is the Wyhat + b part of the MeshNet
+
+                else:
+                    X_model = y
+                yhat = model.predict_equilibrium(u_model, X_model)
+                layer_outputs.append(yhat)
+            prev_outputs = layer_outputs
+        return prev_outputs
