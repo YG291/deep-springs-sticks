@@ -396,7 +396,6 @@ class SympyCalc:
         self.M = M / torch.prod(self.n_sticks)
         self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
         self.k  = symbols('k')
-        self.k2 = symbols('k2')
 
         # Initialize symbolic variables, kinetic and elastic energies.
         self._init_symbols(n_labels)
@@ -451,15 +450,21 @@ class SympyCalc:
 
     def _init_elastic_energy(self):
         # Elastic energy to keep neighboring states near the rest length.
-        uelastic = 0
+        springs = []
         for i in range(len(self.x_symbols.shape) - 1):
             slice_front = [slice(None)] * len(self.x_symbols.shape)
             slice_back  = [slice(None)] * len(self.x_symbols.shape)
             slice_front[i] = slice(1, None)
             slice_back[i]  = slice(None, -1)
             difference = (self.x_symbols[tuple(slice_front)] - self.x_symbols[tuple(slice_back)] - float(self.ell[i])) ** 2
-            difference = difference.ravel()
-            uelastic = Add(uelastic, self.k2 / 2 * Add(*difference))
+            springs.extend(difference.ravel().tolist())
+
+        # order of springs is axis 0, axis 1, axis 2, ...
+        self.n_springs = len(springs)
+        self.k2_symbols = np.array(symbols(f'k2_0:{self.n_springs}'))
+        uelastic = Add(*[self.k2_symbols[e] / 2 * springs[e] for e in range(self.n_springs)])
+        #each spring scaled symbolically by its own k2
+
         self.uelastic_symbols = simplify(uelastic)
 
     def _init_lagrangian(self):
@@ -512,7 +517,7 @@ class SympyCalc:
         #shared nonpotential derivatives
         self.Jz_nonpot = self.forcing_nonpot.jacobian(x_flat)
         #∂F_nonpot/∂z*
-        self.Jk2_nonpot = diff(self.forcing_nonpot, self.k2)
+        self.Jk2_nonpot = self.forcing_nonpot.jacobian(Matrix(self.k2_symbols))
         #∂F/∂k2
 
         #pointwise (potential) derivatives
@@ -525,7 +530,7 @@ class SympyCalc:
 
     def _lambdify_all(self):
         state_args = [*self.x_symbols.flatten(), *self.dx_symbols.flatten()]
-        nonpot_args = [*state_args, self.k2]
+        nonpot_args = [*state_args, *self.k2_symbols]
         pot_args = [*state_args, *self.w_symbols, *self.X_symbols, self.k]
 
         #shared nonpot
@@ -593,12 +598,13 @@ class DEQ(nn.Module):
         self.state_size = torch.prod(self.n_sticks + 1) * 2 * n_labels
 
         self.k = nn.Parameter(torch.tensor(float(k)))
-        self.k2 = nn.Parameter(torch.tensor(float(k2)))
+        self.k2 = nn.Parameter(torch.full((sympy.n_springs,), float(k2)))
         self.M = M / torch.prod(self.n_sticks)
         self.kb = kb
         self.temp = temp
         self.friction = float(friction)
         self.eta_cte = float(np.sqrt(2 * self.friction * temp * kb / self.M))
+        #eta_cte is the noise term
 
         self.sympy = sympy
         #sympy is literally an instance of SympyCalc
@@ -664,7 +670,7 @@ class DEQ(nn.Module):
             for j in range(d):
                 gate = gate * memberships[j][:, int(grid_idx[j])]
             ypred = ypred + gate.unsqueeze(-1) * pred_i
-        return ypred
+        return ypred # output [n_points, n_labels]
     
     def soft_weights(self, u):
         """same as y_prediction_approx, but we get [n_points, n_nodes]
@@ -708,10 +714,10 @@ class DEQ(nn.Module):
         wn  = w.detach().cpu().numpy()
         Xn  = X.detach().cpu().numpy()
         k= float(self.k)
-        k2 = float(self.k2)
+        k2 = self.k2.detach().cpu().numpy()
 
         #nonpot
-        F = np.asarray(self.sympy.f_nonpot(*qn, *dqn, k2)).reshape(self.N)
+        F = np.asarray(self.sympy.f_nonpot(*qn, *dqn, *k2)).reshape(self.N)
 
         #pot
         w_args = [wn[:,j] for j in range(wn.shape[1])]
@@ -745,7 +751,7 @@ class DEQ(nn.Module):
         #_eta_cte defined in forward
     
     def forward(self, u, X, y0=None, 
-                dt = 0.01, window=20, max_iters=100, tol=1e-3, floor = 1e-3, cooling = 0.75):
+                dt = 0.01, window=20, max_iters=100, tol=1e-3, floor = 1e-3, cooling = 0.85):
         """
         eta_cte : base noise amplitude
         cooling : rate at which we decrease _eta_cur geometrically
@@ -787,10 +793,10 @@ class DEQ(nn.Module):
         dqn = np.zeros(self.N)
         wn = w.detach().cpu().numpy()
         k = float(self.k)
-        k2 = float(self.k2)
+        k2 = self.k2.detach().cpu().numpy()
 
         #nonpot
-        Jz = np.asarray(self.sympy.jz_nonpot(*qn, *dqn, k2)).reshape(self.N, self.N)
+        Jz = np.asarray(self.sympy.jz_nonpot(*qn, *dqn, *k2)).reshape(self.N, self.N)
 
         #pot
         w_args = [wn[:,j] for j in range(wn.shape[1])]
@@ -817,7 +823,8 @@ class DEQ(nn.Module):
         wn  = w.detach().cpu().numpy()
         Xn  = X.detach().cpu().numpy()
         vn  = v.detach().cpu().numpy()
-        k = float(self.k); k2 = float(self.k2)
+        k = float(self.k)
+        k2 = self.k2.detach().cpu().numpy()
 
         w_args = [wn[:, j] for j in range(wn.shape[1])]
         X_args = [Xn[:, l] for l in range(Xn.shape[1])]
@@ -831,15 +838,16 @@ class DEQ(nn.Module):
         dL_dk = float(vn @ Jk.reshape(self.N, -1).sum(axis=1))
 
         #compute dL/dk2 sum over points
-        Jk2 = np.asarray(self.sympy.jk2_nonpot(*qn, *dqn, k2)).reshape(self.N)
-        dL_dk2 = float(vn @ Jk2)
+        Jk2 = np.asarray(self.sympy.jk2_nonpot(*qn, *dqn, *k2)).reshape(self.N, self.sympy.n_springs)
+        dL_dk2 = vn @ Jk2
+        #each of these vn @ Jk2 -> distributing vn to each Jacobian via matrix mult
+        #not float(vn@Jk2) cuz Jk2 needs to be a vector
 
         dL_dX = torch.as_tensor(dL_dX, dtype=q.dtype, device=q.device)
         return dL_dX, dL_dk, dL_dk2
     
     def predict_equilibrium(self, u, X):
         return _Equilibrium.apply(X, self.k, self.k2, self, u)
-
 
 class MeshNet(nn.Module):
     def __init__(self, layers_spec, n_sticks, boundaries, n_labels,
@@ -910,6 +918,40 @@ class MeshNet(nn.Module):
                 else:
                     X_model = y
                 yhat = model.predict_equilibrium(u_model, X_model)
+                layer_outputs.append(yhat)
+            prev_outputs = layer_outputs
+        return prev_outputs
+    
+    def predict(self, u):
+        """
+        out of sample inference
+        works by freezing layer 0 -> generates yhat_0 -> get X for layer 1
+        -> generates yhat_1 after equilibrium -> get X for layer 2
+        -> generates yhat_2 after equilibrium -> get X for layer 3 -> ...
+        -> final layer result after equilibrium is prediction
+
+        """
+        prev_outputs = None
+        for layer_idx, layer_models in enumerate(self.layers):
+            spec_layer = self.layers_spec[layer_idx]
+            layer_outputs = []
+            for model_idx, model in enumerate(layer_models):
+                spec = spec_layer[model_idx]
+                u_model = u[:,spec["u_dims"]]
+                if "sources" in spec:
+                    key = f"{layer_idx}_{model_idx}"
+                    S = torch.stack([prev_outputs[m][:,dim] for m,dim in spec["sources"]], dim = 1)
+                    X_model=S@self.W[key].t() + self.b[key]
+                    yhat = model.predict_equilibrium(u_model, X_model)
+                else:
+                    qstar = model.z_star[0,:model.N]
+                    #remember z_star is [1, 2N] where first N are positions, rest N are velocities
+
+                    #note that z_star is one step stale because it's the z_star of the last forward pass, 
+                    #, occuring BEFORE the actual final parameters were optimized by our backprop 
+                    #with torch.no_grad():
+                    #   net.forward(u_train, y)
+                    yhat = model.y_prediction_approx(u_model, qstar)
                 layer_outputs.append(yhat)
             prev_outputs = layer_outputs
         return prev_outputs
